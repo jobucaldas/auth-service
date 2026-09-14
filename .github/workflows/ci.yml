@@ -94,14 +94,24 @@ jobs:
       - uses: actions/checkout@v7
       - name: Docker build
         run: docker build -t ${{ env.SERVICE_NAME }}:${{ github.sha }} .
+      - name: Save image artifact
+        run: docker save ${{ env.SERVICE_NAME }}:${{ github.sha }} -o /tmp/image.tar
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ github.sha }}
+          path: /tmp/image.tar
+          retention-days: 1
   trivy-image:
     name: Trivy image scan
     needs: docker-build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - name: Docker build
-        run: docker build -t ${{ env.SERVICE_NAME }}:${{ github.sha }} .
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ github.sha }}
+          path: /tmp
+      - name: Load image artifact
+        run: docker load -i /tmp/image.tar
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -127,8 +137,12 @@ jobs:
         if: github.event_name == 'push'
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
-      - name: Docker build
-        run: docker build -t ${{ env.SERVICE_NAME }}:${{ github.sha }} .
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ github.sha }}
+          path: /tmp
+      - name: Load image artifact
+        run: docker load -i /tmp/image.tar
       - name: Push image to ECR
         if: github.event_name == 'push'
         env:
@@ -164,11 +178,17 @@ jobs:
           git add k8s/app/${{ env.SERVICE_NAME }}/deployment.yaml
           git diff --cached --quiet && exit 0
           git commit -m "chore(gitops): update ${{ env.SERVICE_NAME }} image to ${{ github.sha }}"
+          success=false
           for _ in 1 2 3 4 5; do
             if git pull --rebase origin ${{ env.GITOPS_BRANCH }}; then
               if git push origin HEAD:${{ env.GITOPS_BRANCH }}; then
+                success=true
                 break
               fi
             fi
             sleep 10
           done
+          if [ "$success" != "true" ]; then
+            echo "GitOps push failed after retries"
+            exit 1
+          fi
