@@ -17,39 +17,68 @@ env:
   GITOPS_BRANCH: t3
 
 jobs:
-  ci:
-    name: Test, scan and publish
+  build-test:
+    name: Build and test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
-
       - name: Build
         run: go build ./...
-
       - name: Unit tests
         run: go test ./...
-
+  lint:
+    name: Lint
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: Lint
         uses: golangci/golangci-lint-action@v9
         with:
           version: latest
-
+  sca:
+    name: SCA dependency scan
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: SCA dependency scan
         continue-on-error: true
         uses: golang/govulncheck-action@v1
         with:
           go-package: ./...
-
+  sast:
+    name: SAST with gosec
+    needs: sca
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
       - name: SAST with gosec
         uses: securego/gosec@v2.22.9
         with:
           args: "-severity high -confidence medium ./..."
-
+  trivy-fs:
+    name: Trivy filesystem scan
+    needs: sast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -57,23 +86,22 @@ jobs:
           severity: CRITICAL
           exit-code: "1"
           ignore-unfixed: false
-
-      - name: Configure AWS credentials
-        if: github.event_name == 'push'
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Login to ECR
-        if: github.event_name == 'push'
-        id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
+  docker-build:
+    name: Docker build
+    needs: trivy-fs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
       - name: Docker build
         run: docker build -t ${{ env.SERVICE_NAME }}:${{ github.sha }} .
-
+  trivy-image:
+    name: Trivy image scan
+    needs: docker-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Docker build
+        run: docker build -t ${{ env.SERVICE_NAME }}:${{ github.sha }} .
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -81,7 +109,26 @@ jobs:
           severity: CRITICAL
           exit-code: "1"
           ignore-unfixed: false
-
+  publish:
+    name: Publish and update GitOps
+    needs: trivy-image
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure AWS credentials
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        if: github.event_name == 'push'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Docker build
+        run: docker build -t ${{ env.SERVICE_NAME }}:${{ github.sha }} .
       - name: Push image to ECR
         if: github.event_name == 'push'
         env:
@@ -94,7 +141,6 @@ jobs:
             docker push "$IMAGE_URI"
           fi
           echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
-
       - name: Update GitOps image tag
         if: github.event_name == 'push'
         uses: actions/checkout@v7
@@ -103,13 +149,11 @@ jobs:
           ref: ${{ env.GITOPS_BRANCH }}
           token: ${{ secrets.GITOPS_TOKEN }}
           path: gitops
-
       - name: Install yq
         if: github.event_name == 'push'
         run: |
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
-
       - name: Commit GitOps image tag
         if: github.event_name == 'push'
         working-directory: gitops
@@ -120,4 +164,11 @@ jobs:
           git add k8s/app/${{ env.SERVICE_NAME }}/deployment.yaml
           git diff --cached --quiet && exit 0
           git commit -m "chore(gitops): update ${{ env.SERVICE_NAME }} image to ${{ github.sha }}"
-          for i in 1 2 3 4 5; do git pull --rebase origin ${{ env.GITOPS_BRANCH }} && git push origin HEAD:${{ env.GITOPS_BRANCH }} && break || sleep 10; done
+          for _ in 1 2 3 4 5; do
+            if git pull --rebase origin ${{ env.GITOPS_BRANCH }}; then
+              if git push origin HEAD:${{ env.GITOPS_BRANCH }}; then
+                break
+              fi
+            fi
+            sleep 10
+          done
