@@ -101,6 +101,7 @@ jobs:
           name: image-${{ github.sha }}
           path: /tmp/image.tar
           retention-days: 1
+          overwrite: true
   trivy-image:
     name: Trivy image scan
     needs: docker-build
