@@ -29,7 +29,16 @@ jobs:
       - name: Build
         run: go build ./...
       - name: Unit tests
-        run: go test ./...
+        run: go test ./... -coverprofile=coverage.out
+
+      - name: Upload test coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gotest-${{ github.sha }}
+          path: coverage.out
+          retention-days: 7
+          overwrite: true
   lint:
     name: Lint
     needs: build-test
@@ -79,13 +88,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Trivy filesystem scan
+      - name: Trivy filesystem scan (SARIF)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-fs.sarif
+          exit-code: "0"
+
+      - name: Trivy filesystem scan (gate)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           severity: CRITICAL
           exit-code: "1"
           ignore-unfixed: false
+
+      - name: Upload Trivy filesystem SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-${{ github.sha }}
+          path: trivy-fs.sarif
+          retention-days: 7
+          overwrite: true
+
+      - name: Upload Trivy filesystem SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4.37.9
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
   docker-build:
     name: Docker build
     needs: trivy-fs
@@ -113,13 +147,38 @@ jobs:
           path: /tmp
       - name: Load image artifact
         run: docker load -i /tmp/image.tar
-      - name: Trivy image scan
+      - name: Trivy image scan (SARIF)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.SERVICE_NAME }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "0"
+
+      - name: Trivy image scan (gate)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.SERVICE_NAME }}:${{ github.sha }}
           severity: CRITICAL
           exit-code: "1"
           ignore-unfixed: false
+
+      - name: Upload Trivy image SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-${{ github.sha }}
+          path: trivy-image.sarif
+          retention-days: 7
+          overwrite: true
+
+      - name: Upload Trivy image SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4.37.9
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
   publish:
     name: Publish and update GitOps
     needs: trivy-image
